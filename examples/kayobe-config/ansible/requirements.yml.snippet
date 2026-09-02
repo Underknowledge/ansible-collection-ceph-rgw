@@ -1,0 +1,9 @@
+---
+# Add this entry under the `collections:` list in etc/kayobe/ansible/requirements.yml.
+# `kayobe control host bootstrap` runs ansible-galaxy against this file and pulls the collection
+# (same mechanism your cephadm collection uses).
+# Pin `version` to a tag or commit once you cut a release. `main` tracks the tip.
+collections:
+  - name: https://github.com/Underknowledge/ansible-collection-ceph-rgw.git
+    type: git
+    version: main

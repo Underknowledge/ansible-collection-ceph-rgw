@@ -1,0 +1,119 @@
+---
+# Provisioning step 1: tenant identity boundary (state: present). Included by provision.yml. Runs first: one RGW account per
+# tenant, its account-root user, and gated rotation of that user's S3 keys to the vaulted value. Depends on the setup done in
+# main.yml.
+
+# One RGW account per tenant (the isolation boundary) Fixed account_id (validated above) keeps every
+# role ARN known from config and stable. Reports CREATED on first run, OK on re-run. Values pass as
+# positional bash params ("$1", ...) via argv: the command module hands each element to bash
+# literally, with no shlex and no shell parse, so there is no interpolation or injection surface.
+- name: Ensure one RGW account per tenant
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        acct=$1; name=$2
+        if radosgw-admin account get --account-id="$acct" >/dev/null 2>&1; then
+          echo OK
+        else
+          radosgw-admin account create --account-name="tenant-$name" --account-id="$acct" >/dev/null && echo CREATED
+        fi
+      - _
+      - "{{ item.account_id }}"
+      - "{{ item.name }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "tenant-{{ item.name }} ({{ item.account_id }})"
+  register: rgw_tenants_account_reg
+  changed_when: "'CREATED' in rgw_tenants_account_reg.stdout"
+  become: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+# Primary account-root user per tenant (bootstraps buckets, never given to users) --display-name must equal
+# --uid: in the IAM-accounts model the user ARN is <account_id>:user/<display-name>, so a divergence silently
+# breaks any trust-policy Principal
+# ARN that names this user. radosgw-admin has no keyfile or env intake,
+# so the vaulted keys ride the argv while this runs. no_log hides them from Ansible output. They are
+# still briefly visible in the host `ps` and /proc/<pid>/cmdline, so consider hidepid=2 on the mon. The
+# boto3 steps below take their creds from the environment.
+- name: Ensure the primary account-root user per tenant
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        uid=$1; acct=$2; ak=$3; sk=$4
+        if radosgw-admin user info --uid="$uid" --account-id="$acct" >/dev/null 2>&1; then
+          echo OK
+        else
+          radosgw-admin user create --uid="$uid" --account-id="$acct" --account-root \
+            --display-name="$uid" --access-key="$ak" --secret-key="$sk" >/dev/null && echo CREATED
+        fi
+      - _
+      - "{{ item.root_user | default(item.name ~ 'root') }}"
+      - "{{ item.account_id }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_access_key') }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.root_user | default(item.name ~ 'root') }}"
+  register: rgw_tenants_user_reg
+  changed_when: "'CREATED' in rgw_tenants_user_reg.stdout"
+  no_log: true
+  become: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+# Roll account-root S3 keys to the vaulted value (gated) The create task above never touches an existing user's
+# keys, so a routine converge run never rotates live credentials. This task does, only when gated on
+# (rgw_tenants_rotate_keys globally, or item.rotate_keys per tenant). See the defaults. It stays idempotent
+# while gated on: it rotates only when the vaulted key is not already the user's key, and prunes any other
+# access keys to hold the
+# single-key model. AK and SK ride the argv (radosgw-admin has no keyfile intake), hence no_log.
+# The compare reads them from the environment so they never reach python's argv.
+- name: Rotate account-root S3 keys to the vaulted value (gated)
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        set -eu
+        uid=$1; acct=$2; ak=$3; sk=$4
+        info=$(radosgw-admin user info --uid="$uid" --account-id="$acct")
+        match=$(printf '%s' "$info" | AK="$ak" SK="$sk" python3 -c 'import sys,json,os; ks=json.load(sys.stdin).get("keys",[]); print("yes" if any(k.get("access_key")==os.environ["AK"] and k.get("secret_key")==os.environ["SK"] for k in ks) else "no")')
+        if [ "$match" = yes ]; then
+          echo OK
+        else
+          # Install the vaulted key first and only prune the old keys once it is in place, so a failed create
+          # (set -e aborts here, task fails) never strands the account key-less.
+          radosgw-admin key create --uid="$uid" --account-id="$acct" \
+            --access-key="$ak" --secret-key="$sk" >/dev/null
+          for old in $(printf '%s' "$info" | AK="$ak" python3 -c 'import sys,json,os; [print(k["access_key"]) for k in json.load(sys.stdin).get("keys",[]) if k.get("access_key")!=os.environ["AK"]]'); do
+            radosgw-admin key rm --uid="$uid" --account-id="$acct" --access-key="$old" >/dev/null
+          done
+          echo CHANGED
+        fi
+      - _
+      - "{{ item.root_user | default(item.name ~ 'root') }}"
+      - "{{ item.account_id }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_access_key') }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.root_user | default(item.name ~ 'root') }}"
+  register: rgw_tenants_rotate_reg
+  changed_when: "'CHANGED' in rgw_tenants_rotate_reg.stdout"
+  no_log: true
+  become: true
+  when:
+    - (rgw_tenants_rotate_keys | default(false) | bool) or (item.rotate_keys | default(false) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host

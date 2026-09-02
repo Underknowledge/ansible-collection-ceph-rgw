@@ -1,0 +1,35 @@
+# Build artifacts / archives (e.g. underknowledge-ceph_rgw-0.2.0.tar.gz).
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tgz
+*.zip
+
+*.pyc
+__pycache__/
+roles/*/files/__pycache__/
+.venv/
+
+# Hidden files and directories are ignored by default (e.g. editor and tool state).
+# Files already tracked stay tracked. Force-add a new one with `git add -f`.
+.*
+!.gitignore
+!.ansible-lint
+
+# Markdown is ignored by default to keep drafts and scratch notes out of commits.
+# Add intentional docs (READMEs, changelog) with `git add -f`.
+*.md
+
+# Editor / temp / backup files (nano, vim, emacs, generic scratch).
+*~
+*.bak
+*.tmp
+*.orig
+*.swp
+*.swo
+*.save
+.*.swp
+.*.swo
+\#*\#
+.\#*

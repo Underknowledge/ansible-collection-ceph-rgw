@@ -1,0 +1,169 @@
+---
+# Configure native RGW STS. Policy JSON is templated to /var/run/ceph/<fsid>/ on the host.
+# `cephadm shell` bind-mounts that as /var/run/ceph in the container,
+# and radosgw-admin reads each doc by basename.
+# All radosgw-admin/ceph work runs on the bootstrap host.
+- name: Discover the cluster fsid
+  ansible.builtin.command: cephadm shell -- ceph fsid
+  when:
+    - rgw_sts_fsid | length == 0
+    - inventory_hostname == rgw_sts_bootstrap_host
+  become: true
+  register: rgw_sts_fsid_current
+  changed_when: false
+  check_mode: false
+
+- name: Set the fsid fact
+  ansible.builtin.set_fact:
+    _rgw_sts_fsid: "{{ rgw_sts_fsid if rgw_sts_fsid | length > 0 else rgw_sts_fsid_current.stdout }}"
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+# STS runtime config (read at RGW startup => restart on change). The signing key goes to bash as a positional
+# param ($1) via argv. It is never shell-interpolated, so there is no injection surface.
+# `ceph config set` has no env/stdin/file intake for the key,
+# so it shows on the mon's process argv (`ps`, `/proc/<pid>/cmdline`) for the duration of the call. Mount /proc with `hidepid=2`
+# on the mon to limit who sees it. no_log keeps it out of Ansible logs.
+- name: Set the STS session-token signing key (rgw_sts_key)
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        key=$1
+        cur=$(ceph config get client.rgw rgw_sts_key)
+        if [ "$cur" != "$key" ]; then
+          ceph config set client.rgw rgw_sts_key "$key"; echo CHANGED
+        fi
+      - _
+      - "{{ rgw_sts_key }}"
+  register: rgw_sts_key_reg
+  changed_when: "'CHANGED' in rgw_sts_key_reg.stdout"
+  notify: Restart RGW
+  no_log: true
+  become: true
+  when:
+    - rgw_sts_key | length > 0
+    - inventory_hostname == rgw_sts_bootstrap_host
+
+# Gate the auth switch on a real signing key. Enabling rgw_s3_auth_use_sts while rgw_sts_key is unset would leave RGW
+# signing session tokens with Ceph's well-known built-in default "sts" (see the defaults comment): forgeable tokens.
+# The key-set task above is a no-op when rgw_sts_key is empty, so without this assert an unconfigured import would turn
+# STS auth on with the insecure default and restart RGW. Fail loudly instead, before flipping the switch.
+- name: Assert a real STS signing key is set before enabling STS auth
+  ansible.builtin.assert:
+    quiet: true
+    that: rgw_sts_key | length > 0
+    fail_msg: >-
+      Refusing to enable rgw_s3_auth_use_sts while rgw_sts_key is unset: RGW would sign STS
+      session tokens with Ceph's well-known default key "sts", making them forgeable. Set
+      rgw_sts_key from vault_rgw_sts_key (16+ random chars) and re-run.
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+- name: Enable STS auth on the S3 endpoint (rgw_s3_auth_use_sts)
+  ansible.builtin.command: >
+    cephadm shell -- bash -c
+    'cur=$(ceph config get client.rgw rgw_s3_auth_use_sts);
+     if [ "$cur" != "true" ]; then
+       ceph config set client.rgw rgw_s3_auth_use_sts true; echo CHANGED;
+     fi'
+  register: rgw_sts_use_sts_reg
+  changed_when: "'CHANGED' in rgw_sts_use_sts_reg.stdout"
+  notify: Restart RGW
+  become: true
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+# IAM roles for AssumeRole
+- name: Template STS role trust-policy documents
+  ansible.builtin.copy:
+    dest: "/var/run/ceph/{{ _rgw_sts_fsid }}/sts-trust-{{ item.name }}.json"
+    content: "{{ item.trust_policy | to_nice_json }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ rgw_sts_roles }}"
+  loop_control:
+    label: "{{ item.name }}"
+  become: true
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+# Role name and account_id go to bash as positional params ($1/$2) via argv.
+# Never shell-interpolated, so no injection surface and no `| quote`.
+# The trust-policy doc is read from the staged file by basename inside the container.
+- name: Ensure STS IAM roles exist
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        name=$1; acct=$2
+        acct_arg=""
+        [ -n "$acct" ] && acct_arg="--account-id=$acct"
+        if radosgw-admin role get --role-name="$name" $acct_arg >/dev/null 2>&1; then
+          echo OK
+        else
+          radosgw-admin role create --role-name="$name" $acct_arg \
+            --assume-role-policy-doc="$(cat /var/run/ceph/sts-trust-${name}.json)" >/dev/null && echo CREATED
+        fi
+      - _
+      - "{{ item.name }}"
+      - "{{ item.account_id | default('') }}"
+  loop: "{{ rgw_sts_roles }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: rgw_sts_role_reg
+  changed_when: "'CREATED' in rgw_sts_role_reg.stdout"
+  become: true
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+- name: Template STS role permission-policy documents
+  ansible.builtin.copy:
+    dest: "/var/run/ceph/{{ _rgw_sts_fsid }}/sts-perm-{{ item.0.name }}-{{ item.1.name }}.json"
+    content: "{{ item.1.document | to_nice_json }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop: "{{ rgw_sts_roles | subelements('policies') }}"
+  loop_control:
+    label: "{{ item.0.name }}/{{ item.1.name }}"
+  become: true
+  when: inventory_hostname == rgw_sts_bootstrap_host
+
+# Role name, account_id and policy name go to bash as positional params ($1/$2/$3) via argv.
+# No shell-interpolation, no `| quote`. role-policy put is an idempotent overwrite.
+# Compare the on-cluster doc first and put (+ echo PUT) only when the policy is absent or drifted.
+# changed_when gates on the PUT token.
+- name: Attach permission policies to STS roles
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        name=$1; acct=$2; pol=$3
+        acct_arg=""
+        [ -n "$acct" ] && acct_arg="--account-id=$acct"
+        want=$(cat /var/run/ceph/sts-perm-${name}-${pol}.json)
+        have=$(radosgw-admin role-policy get --role-name="$name" $acct_arg --policy-name="$pol" 2>/dev/null)
+        if [ "$have" != "$want" ]; then
+          radosgw-admin role-policy put --role-name="$name" $acct_arg --policy-name="$pol" \
+            --policy-doc="$want" >/dev/null && echo PUT
+        fi
+      - _
+      - "{{ item.0.name }}"
+      - "{{ item.0.account_id | default('') }}"
+      - "{{ item.1.name }}"
+  loop: "{{ rgw_sts_roles | subelements('policies') }}"
+  loop_control:
+    label: "{{ item.0.name }}/{{ item.1.name }}"
+  register: rgw_sts_role_policy_reg
+  changed_when: "'PUT' in rgw_sts_role_policy_reg.stdout"
+  become: true
+  when: inventory_hostname == rgw_sts_bootstrap_host

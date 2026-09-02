@@ -1,0 +1,25 @@
+---
+# Provisioning path (state: present). Included by main.yml when _rgw_tenants_present is non-empty. The setup these
+# tasks depend on (_rgw_tenants_fsid, the boto3 helpers under /var/run/ceph/<fsid>/) runs in main.yml first.
+#
+# Thin orchestrator: includes the steps in dependency order, each in its own file. Order matters:
+#   provision_accounts.yml    account -> primary account-root user -> (gated key rotation)
+#   provision_root_users.yml  additional account-root users (create / suspend / offboard)
+#   provision_quotas.yml      storage quota -> entity limits
+#   provision_roles.yml       OIDC provider -> per-tier IAM roles -> (gated prune)
+#   provision_buckets.yml     per-tenant buckets (created as account-root)
+
+- name: Provision tenant accounts, users, and (gated) key rotation
+  ansible.builtin.include_tasks: provision_accounts.yml
+
+- name: Provision additional account-root users (create / suspend / offboard)
+  ansible.builtin.include_tasks: provision_root_users.yml
+
+- name: Reconcile tenant account quotas and entity limits
+  ansible.builtin.include_tasks: provision_quotas.yml
+
+- name: Register OIDC providers and provision per-tier IAM roles
+  ansible.builtin.include_tasks: provision_roles.yml
+
+- name: Create per-tenant buckets
+  ansible.builtin.include_tasks: provision_buckets.yml

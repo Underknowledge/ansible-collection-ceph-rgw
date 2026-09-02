@@ -1,0 +1,253 @@
+---
+# Multi-tenant provisioning entrypoint. Shared setup lives here: discover the fsid, split tenants by desired
+# state, validate inputs, check the rgw_sts preflight, wait for RGW, stage the boto3 helpers. Then hand off to two
+# included task files:
+#   tasks/provision.yml  the state: present path (accounts, users, quota, limits, OIDC,
+#                         roles, buckets)
+#   tasks/teardown.yml   the state: absent path (idempotent decommission)
+# radosgw-admin runs on the bootstrap host via `cephadm shell`. boto3 helpers run
+# on the host with creds from the environment, never argv. Account-scoped ops pass --account-id.
+- name: Discover the cluster fsid
+  ansible.builtin.command: cephadm shell -- ceph fsid
+  when:
+    - rgw_tenants_fsid | length == 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+  become: true
+  register: rgw_tenants_fsid_current
+  changed_when: false
+  check_mode: false
+
+- name: Set the fsid fact
+  ansible.builtin.set_fact:
+    _rgw_tenants_fsid: "{{ rgw_tenants_fsid if rgw_tenants_fsid | length > 0 else rgw_tenants_fsid_current.stdout }}"
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+# Drop-in tenant directory (opt-in) Load every file in rgw_tenants_dir as host vars: each defines a per-tenant
+# `rgw_tenant_<name>` config dict plus its `vault_rgw_tenants_<name>_*` keys (inline !vault, decrypted here). Then
+# append every rgw_tenant_* config to rgw_tenants_list. The keys land under the exact global names the
+# provisioning/teardown tasks already look up, so no key-sourcing change is needed. Runs before discovery/validation
+# so both see the drop-in tenants. The regex matches the singular rgw_tenant_<slug> key (slug is [a-z0-9_]+, e.g.
+# initrode_data_prod); the trailing 's' in every rgw_tenants_* role var means those are never caught (rgw_tenant_ !=
+# rgw_tenants_).
+- name: Load tenant drop-ins (config + vaulted keys) from rgw_tenants_dir
+  ansible.builtin.include_vars:
+    dir: "{{ rgw_tenants_dir }}"
+    extensions:
+      - yml
+      - yaml
+  when: rgw_tenants_dir | length > 0
+
+- name: Assemble rgw_tenants_list from the drop-ins
+  ansible.builtin.set_fact:
+    rgw_tenants_list: >-
+      {{ (rgw_tenants_list | default([], true))
+         + (query('ansible.builtin.varnames', '^rgw_tenant_[a-z0-9_]+$')
+            | map('extract', vars) | list) }}
+  when: rgw_tenants_dir | length > 0
+
+# Brownfield discovery / adoption (opt-in, read-only) When rgw_tenants_discover is set, run discovery instead of
+# provisioning: inventory every RGW account, classify managed-vs-unmanaged against rgw_tenants_list, write
+# adoption stubs, end the play. Runs before validation and the STS preflight so it works on a cluster with no
+# rgw_tenants_list or OIDC configured yet.
+- name: Discover + adopt existing RGW accounts (read-only)
+  ansible.builtin.include_tasks: discover.yml
+  when:
+    - rgw_tenants_discover | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: End the play after discovery (no provisioning in discover mode)
+  ansible.builtin.meta: end_play
+  when: rgw_tenants_discover | bool
+
+# Partition tenants by desired state Provisioning loops iterate _rgw_tenants_present. Teardown loops
+# iterate _rgw_tenants_absent. An item with no `state` key is present. Computed on every host so the
+# loop expressions stay defined even where the bootstrap-host `when` skips their tasks. The split
+# defaults state to present: items without a state key, plus items whose state is set but not 'absent'.
+- name: Partition tenants into present and absent
+  ansible.builtin.set_fact:
+    _rgw_tenants_present: >-
+      {{ (rgw_tenants_list | rejectattr('state', 'defined') | list)
+         + (rgw_tenants_list | selectattr('state', 'defined')
+            | rejectattr('state', 'equalto', 'absent') | list) }}
+    _rgw_tenants_absent: >-
+      {{ rgw_tenants_list | selectattr('state', 'defined')
+         | selectattr('state', 'equalto', 'absent') | list }}
+
+# Validate inputs before touching the cluster
+- name: Validate tenant configuration
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - rgw_tenants_endpoint | length > 0
+      - rgw_tenants_oidc.provider_url | length > 0
+      - rgw_tenants_oidc.thumbprints | length > 0
+      - rgw_tenants_oidc.thumbprints | reject('match', '^[0-9a-fA-F]{40}$') | list | length == 0
+    fail_msg: >-
+      rgw_tenants_endpoint and rgw_tenants_oidc.provider_url must be set, and every
+      thumbprint must be a 40-hex SHA1 of the JWKS signing cert (not the CHANGEME placeholder).
+      See the role README for the computation recipe.
+  when:
+    - rgw_tenants_list | length > 0
+    - not (rgw_tenants_plan | default(false) | bool)
+    - not (rgw_tenants_report | default(false) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# name allows [a-z0-9_] (lowercase snake_case account names like initrode_data_prod, and legacy single-word names like acme);
+# the generator enforces the stricter <org>_<purpose> convention for NEW accounts. root_user additionally allows hyphens for
+# the iam-<account>-root convention. The rgw_new_tenant playbook writes root_user as iam-<name>-root; older tenants keep
+# their <name>root uid.
+- name: Validate each tenant entry
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.name is match('^[a-z0-9][a-z0-9_]*$')
+      - item.account_id is match('^RGW[0-9]{17}$')
+      - (item.root_user | default(item.name ~ 'root')) is match('^[a-z0-9][a-z0-9_-]*$')
+      - lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_access_key', default='') | length > 0
+      - lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_secret_key', default='') | length > 0
+      - item.buckets | default([]) | reject('match', '^' ~ (item.bucket_prefix | default(item.name ~ '-'))) | list | length == 0
+    fail_msg: >-
+      tenant '{{ item.name }}' is invalid: name must be lowercase [a-z0-9_], root_user
+      [a-z0-9_-], account_id RGW+17 digits, vault_rgw_tenants_{{ item.name }}_access_key/
+      _secret_key must be defined, and every bucket must start with the prefix
+      '{{ item.bucket_prefix | default(item.name ~ '-') }}'.
+  loop: "{{ rgw_tenants_list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when:
+    - not (rgw_tenants_plan | default(false) | bool)
+    - not (rgw_tenants_report | default(false) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Validate each declared root_user: slug rules and that its vaulted keys resolve. uid is
+# iam-<account>-root[-<descriptor>]; the vault keys are vault_rgw_tenants_<name>_root_<slug>_*.
+- name: Validate each tenant's root_users
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - item.1.name is match('^[a-z0-9][a-z0-9_]*$')
+      - (item.1.state | default('present')) in ['present', 'absent']
+      - (item.1.state | default('present')) == 'absent'
+        or lookup('vars', 'vault_rgw_tenants_' ~ item.0.name ~ '_root_' ~ item.1.name ~ '_access_key', default='') | length > 0
+      - (item.1.state | default('present')) == 'absent'
+        or lookup('vars', 'vault_rgw_tenants_' ~ item.0.name ~ '_root_' ~ item.1.name ~ '_secret_key', default='') | length > 0
+    fail_msg: >-
+      tenant '{{ item.0.name }}' root_user '{{ item.1.name }}' is invalid:
+      name must be [a-z0-9_], state present|absent, and (when present)
+      vault_rgw_tenants_{{ item.0.name }}_root_{{ item.1.name }}_access_key/_secret_key must be defined.
+  loop: "{{ rgw_tenants_list | subelements('root_users', skip_missing=true) }}"
+  loop_control:
+    label: "{{ item.0.name }}/{{ item.1.name }}"
+  when:
+    - not (rgw_tenants_plan | default(false) | bool)
+    - not (rgw_tenants_report | default(false) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Drift preview (opt-in, read-only) When rgw_tenants_plan is set, report what a real run would change for the
+# configured tenants (create/quota/limits/roles/buckets/decommission) and end the play. Validation above is skipped
+# here. A preview needs no vault keys or endpoint/OIDC config,
+# only radosgw-admin get/list/info/stats, so it works against tenants whose secrets you do not hold.
+- name: Preview drift for the configured tenants (read-only)
+  ansible.builtin.include_tasks: plan.yml
+  when:
+    - rgw_tenants_plan | default(false) | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: End the play after the plan (no provisioning in plan mode)
+  ansible.builtin.meta: end_play
+  when: rgw_tenants_plan | default(false) | bool
+
+# Usage report (opt-in, read-only) When rgw_tenants_report is set, print each configured tenant's used size/objects
+# vs its storage quota and end the play. Read-only: only radosgw-admin get/stats.
+- name: Report tenant usage vs quota (read-only)
+  ansible.builtin.include_tasks: report.yml
+  when:
+    - rgw_tenants_report | default(false) | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: End the play after the report (no provisioning in report mode)
+  ansible.builtin.meta: end_play
+  when: rgw_tenants_report | default(false) | bool
+
+# Preflight: rgw_sts must have run first
+- name: Confirm native STS is enabled (rgw_sts ran first)
+  ansible.builtin.command: cephadm shell -- ceph config get client.rgw rgw_s3_auth_use_sts
+  register: rgw_tenants_sts_check
+  changed_when: false
+  check_mode: false
+  become: true
+  when:
+    - rgw_tenants_list | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Assert native STS is on
+  ansible.builtin.assert:
+    quiet: true
+    that: "rgw_tenants_sts_check.stdout | trim == 'true'"
+    fail_msg: >-
+      rgw_s3_auth_use_sts is not 'true'; run the rgw_sts role (cephadm-sts.yml) before
+      rgw_tenants (cephadm-tenants.yml). See the collection README ordering note.
+  when:
+    - rgw_tenants_list | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Wait for RGW to be reachable (rgw_sts restarts it async)
+- name: Wait for the RGW endpoint to answer
+  ansible.builtin.uri:
+    url: "{{ rgw_tenants_endpoint }}"
+    method: GET
+    status_code: [200, 403, 405]
+    validate_certs: false
+  register: rgw_tenants_endpoint_reg
+  until: rgw_tenants_endpoint_reg.status in [200, 403, 405]
+  retries: 30
+  delay: 5
+  when:
+    - rgw_tenants_list | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Stage the boto3 helpers in the root-owned fsid dir, not world-writable /tmp. Both paths use them. provision.yml registers
+# OIDC providers, roles, and buckets. Teardown deletes the OIDC provider with the same helper.
+- name: Stage the boto3 helpers on the host
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/var/run/ceph/{{ _rgw_tenants_fsid }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - manage_oidc_provider.py
+    - manage_role.py
+    - manage_buckets.py
+  become: true
+  when:
+    - rgw_tenants_list | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Provision (state: present)
+- name: Provision present tenants
+  ansible.builtin.include_tasks: provision.yml
+  when:
+    - _rgw_tenants_present | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Decommission (state: absent) - gated off the scheduled converge A converge run tears down absent tenants only when
+# rgw_tenants_allow_teardown is on. Committing `state: absent` to group_vars stays safe until an operator runs deliberately
+# with `-e rgw_tenants_allow_teardown=true`. Warn when absent entries are skipped.
+- name: Warn about pending (gated) decommissions
+  ansible.builtin.debug:
+    msg: >-
+      {{ _rgw_tenants_absent | map(attribute='name') | list }} marked state: absent
+      but rgw_tenants_allow_teardown is false; skipping teardown.
+      Re-run with -e rgw_tenants_allow_teardown=true to decommission.
+  when:
+    - _rgw_tenants_absent | length > 0
+    - not (rgw_tenants_allow_teardown | default(false) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Decommission absent tenants
+  ansible.builtin.include_tasks: teardown.yml
+  when:
+    - _rgw_tenants_absent | length > 0
+    - rgw_tenants_allow_teardown | default(false) | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host

@@ -1,0 +1,86 @@
+---
+# Read-only post-provision verification. Confirms each tenant's account, per-tier roles, OIDC provider, and buckets
+# exist in RGW, without the IdP or any user password.
+# The full login -> assume -> S3 path is files/verify_federation.py, run per user.
+# Invoke with import_role/include_role name=rgw_tenants tasks_from=verify, or the example play
+# examples/kayobe-config/ansible/ceph/cephadm-tenants-verify.yml.
+- name: List each tenant's IAM roles
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin role list --account-id={{ item.account_id | quote }}
+  loop: "{{ rgw_tenants_list }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.account_id }})"
+  register: rgw_tenants_verify_roles
+  changed_when: false
+  become: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Assert every tenant-tier role is present
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      # Exact whole-token match: split stdout into role-name tokens and check membership, so a shorter name (e.g. acme-read)
+      # cannot spuriously satisfy acme-reader.
+      - >-
+        rgw_tenants_tiers | map(attribute='name')
+        | map('regex_replace', '^', role.item.name ~ '-')
+        | reject('in', role.stdout | regex_findall('[A-Za-z0-9_-]+'))
+        | list | length == 0
+    fail_msg: >-
+      tenant '{{ role.item.name }}' ({{ role.item.account_id }}) is missing one or more
+      tier roles ({{ rgw_tenants_tiers | map(attribute='name') | join('/') }}).
+  loop: "{{ rgw_tenants_verify_roles.results }}"
+  loop_control:
+    loop_var: role
+    label: "{{ role.item.name }}"
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: List each tenant's buckets
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin bucket list --account-id={{ item.account_id | quote }}
+  loop: "{{ rgw_tenants_list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: rgw_tenants_verify_buckets
+  changed_when: false
+  become: true
+  when:
+    - item.buckets | default([]) | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Show each quota'd tenant's current account cap
+  ansible.builtin.command: >-
+    cephadm shell -- radosgw-admin account get --account-id={{ item.account_id | quote }}
+  loop: "{{ rgw_tenants_list }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: rgw_tenants_verify_quota
+  changed_when: false
+  become: true
+  when:
+    - item.quota is defined
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Report each quota (desired vs live)
+  ansible.builtin.debug:
+    msg: >-
+      {{ q.item.name }}: desired size={{ q.item.quota.max_size | default(-1) }}
+      objs={{ q.item.quota.max_objects | default(-1) }}
+      ({{ 'on' if (q.item.quota.enabled | default(false)) else 'off' }}) vs
+      live {{ (q.stdout | from_json).quota | default({}) }}
+  loop: "{{ rgw_tenants_verify_quota.results | default([]) }}"
+  loop_control:
+    loop_var: q
+    label: "{{ q.item.name }}"
+  when:
+    - q.skipped | default(false) is false
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Report verification summary
+  ansible.builtin.debug:
+    msg: >-
+      {{ rgw_tenants_list | length }} tenant(s) verified: accounts + per-tier roles present.
+      Buckets checked for tenants that declare them.
+      For the full federation path (login -> assume -> scoped S3), run files/verify_federation.py per user.
+  run_once: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host

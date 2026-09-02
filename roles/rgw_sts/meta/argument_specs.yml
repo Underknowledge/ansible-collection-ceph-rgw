@@ -1,0 +1,56 @@
+---
+argument_specs:
+  main:
+    short_description: Enable native Ceph RGW STS.
+    description:
+      - Sets the STS signing key and S3 STS auth, and creates standalone AssumeRole /
+        GetSessionToken IAM roles. Run before the rgw_tenants role.
+    options:
+      rgw_sts_key:
+        type: str
+        required: false
+        description: STS session-token signing key (from vault). Empty skips setting it.
+      rgw_sts_roles:
+        type: list
+        elements: dict
+        required: false
+        description: Standalone IAM roles for AssumeRole / GetSessionToken.
+        options:
+          name:
+            type: str
+            required: true
+            description: Role name.
+          account_id:
+            type: str
+            required: false
+            description: Account id to scope the role to.
+          trust_policy:
+            type: dict
+            required: true
+            description: The assume-role (trust) policy document.
+          policies:
+            type: list
+            elements: dict
+            required: true
+            description: Permission policies to attach.
+            options:
+              name:
+                type: str
+                required: true
+                description: Policy name.
+              document:
+                type: dict
+                required: true
+                description: The permission policy document.
+      rgw_sts_service_name:
+        type: str
+        required: false
+        description: cephadm RGW service to restart on config change (default rgw.rgw).
+      rgw_sts_bootstrap_host:
+        type: str
+        required: false
+        description: Host that runs the ceph commands (default groups['mons'][0]).
+      rgw_sts_fsid:
+        type: str
+        required: false
+        description: Cluster fsid. Empty discovers it via ceph fsid.

@@ -1,0 +1,122 @@
+---
+# Extra account-root users per tenant (state: present). Runs after provision_accounts.yml, so the account and its primary root
+# already exist. These are the mgmt/service/personal roots you add and drop over a tenant's life, each a full account-root user.
+# Buckets are account-owned, so add or remove one without touching tenant data. uid == display-name ==
+# iam-<account>-root-<descriptor> (the ARN contract).
+# Keys ride argv (radosgw-admin has no keyfile/env intake), so no_log plus the ps/hidepid=2
+# caveat from provision_accounts.yml. Three tasks: create present, reconcile suspend, remove absent.
+
+# Create present root users (idempotent). uid/display-name follow the iam- convention.
+- name: Ensure each declared root user exists
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        uid=$1; acct=$2; ak=$3; sk=$4
+        if radosgw-admin user info --uid="$uid" --account-id="$acct" >/dev/null 2>&1; then
+          echo OK
+        else
+          radosgw-admin user create --uid="$uid" --account-id="$acct" --account-root \
+            --display-name="$uid" --access-key="$ak" --secret-key="$sk" >/dev/null && echo CREATED
+        fi
+      - _
+      - "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+      - "{{ item.0.account_id }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.0.name ~ '_root_' ~ item.1.name ~ '_access_key') }}"
+      - "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.0.name ~ '_root_' ~ item.1.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_present | subelements('root_users', skip_missing=true) }}"
+  loop_control:
+    label: "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+  register: rgw_root_user_create_reg
+  changed_when: "'CREATED' in rgw_root_user_create_reg.stdout"
+  no_log: true
+  become: true
+  when:
+    - (item.1.state | default('present')) != 'absent'
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Reconcile suspend state. Non-destructive: keys kept, access blocked.
+- name: Reconcile each root user's suspend state
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        uid=$1; acct=$2; want=$3
+        cur=$(radosgw-admin user info --uid="$uid" --account-id="$acct" \
+              | python3 -c 'import sys,json; print(json.load(sys.stdin).get("suspended",0))')
+        if [ "$want" = "1" ] && [ "$cur" != "1" ]; then
+          radosgw-admin user suspend --uid="$uid" --account-id="$acct" >/dev/null && echo CHANGED
+        elif [ "$want" = "0" ] && [ "$cur" = "1" ]; then
+          radosgw-admin user enable --uid="$uid" --account-id="$acct" >/dev/null && echo CHANGED
+        else
+          echo OK
+        fi
+      - _
+      - "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+      - "{{ item.0.account_id }}"
+      - "{{ '1' if (item.1.suspended | default(false) | bool) else '0' }}"
+  loop: "{{ _rgw_tenants_present | subelements('root_users', skip_missing=true) }}"
+  loop_control:
+    label: "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+  register: rgw_root_user_suspend_reg
+  changed_when: "'CHANGED' in rgw_root_user_suspend_reg.stdout"
+  become: true
+  when:
+    - (item.1.state | default('present')) != 'absent'
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Offboard absent root users: user rm, which revokes the keys too. Gated by
+# rgw_tenants_allow_root_user_removal (default true). Safe because buckets are account-owned, so a committed
+# state: absent is honored on the next converge. OK when already gone. Set the gate false to
+# recognise-but-skip, like tenant teardown.
+- name: Remove absent root users
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        uid=$1; acct=$2
+        if radosgw-admin user info --uid="$uid" --account-id="$acct" >/dev/null 2>&1; then
+          radosgw-admin user rm --uid="$uid" --account-id="$acct" >/dev/null && echo REMOVED
+        else
+          echo OK
+        fi
+      - _
+      - "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+      - "{{ item.0.account_id }}"
+  loop: "{{ _rgw_tenants_present | subelements('root_users', skip_missing=true) }}"
+  loop_control:
+    label: "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+  register: rgw_root_user_rm_reg
+  changed_when: "'REMOVED' in rgw_root_user_rm_reg.stdout"
+  become: true
+  when:
+    - (item.1.state | default('present')) == 'absent'
+    - rgw_tenants_allow_root_user_removal | default(true) | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Offboard pending but the gate is off. Warn so it is not missed.
+- name: Warn about gated (skipped) root-user removals
+  ansible.builtin.debug:
+    msg: >-
+      root user iam-{{ item.0.name }}-root-{{ item.1.name }} is state: absent
+      but rgw_tenants_allow_root_user_removal is false; skipping.
+      Re-run with -e rgw_tenants_allow_root_user_removal=true to offboard.
+  loop: "{{ _rgw_tenants_present | subelements('root_users', skip_missing=true) }}"
+  loop_control:
+    label: "iam-{{ item.0.name }}-root-{{ item.1.name }}"
+  when:
+    - (item.1.state | default('present')) == 'absent'
+    - not (rgw_tenants_allow_root_user_removal | default(true) | bool)
+    - inventory_hostname == rgw_tenants_bootstrap_host

@@ -1,0 +1,10 @@
+---
+# RGW caches OIDC provider info (thumbprint + client ids) in memory. A create or replace via the IAM API does not
+# refresh the running daemon, so web-identity AssumeRole keeps failing with "Signature can not be validated with the
+# JWKS present" until RGW restarts. The OIDC-registration task notifies this on change, so a clean deploy needs no
+# manual bounce.
+- name: Restart RGW for OIDC
+  ansible.builtin.command: "cephadm shell -- ceph orch restart {{ rgw_tenants_service_name }}"
+  changed_when: true
+  become: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host

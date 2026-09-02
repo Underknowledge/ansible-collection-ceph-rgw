@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": {{ item.tier.actions | to_json }},
+      "Resource": [
+        "arn:aws:s3:::{{ item.tenant.bucket_prefix | default(item.tenant.name ~ '-') }}*",
+        "arn:aws:s3:::{{ item.tenant.bucket_prefix | default(item.tenant.name ~ '-') }}*/*"
+      ]
+    }
+  ]
+}

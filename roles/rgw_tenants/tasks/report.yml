@@ -1,0 +1,59 @@
+---
+# Read-only usage-vs-quota report. Included by main.yml when rgw_tenants_report is true. main.yml then ends the
+# play. For each configured tenant it prints used size/objects against the account's storage quota, with a
+# percentage when the cap is finite.
+# Every radosgw-admin call is a read-only get/stats. _rgw_tenants_fsid is set by main.yml
+# before this is included.
+
+- name: Stage the report helper
+  ansible.builtin.copy:
+    src: report_tenants.py
+    dest: "/var/run/ceph/{{ _rgw_tenants_fsid }}/report_tenants.py"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+# Input via a file in the bind-mounted fsid dir (cephadm shell does not carry host env).
+# The helper reads only name + account_id from each tenant. The rest is harmless.
+- name: Stage the report input (configured tenants)
+  ansible.builtin.copy:
+    content: "{{ {'tenants': rgw_tenants_list} | to_json }}"
+    dest: "/var/run/ceph/{{ _rgw_tenants_fsid }}/report_input.json"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Compute the usage report (read-only)
+  ansible.builtin.command: cephadm shell -- python3 /var/run/ceph/report_tenants.py
+  register: _rgw_report_out
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Parse the report
+  ansible.builtin.set_fact:
+    _rgw_report: "{{ (_rgw_report_out.stdout | from_json).reports }}"
+
+- name: "Usage: per tenant"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.name }} ({{ item.account_id }}):
+      size {{ (item.used_size / 1024 / 1024 / 1024) | round(2) }} GiB
+      {{ '/ ' ~ (item.max_size | int / 1024 / 1024 / 1024) | round(2) ~ ' GiB (' ~ item.size_pct ~ '%)' if item.size_pct is not none else '/ unlimited' }};
+      objects {{ item.used_objects }}
+      {{ '/ ' ~ item.max_objects ~ ' (' ~ item.objects_pct ~ '%)' if item.objects_pct is not none else '/ unlimited' }}
+      {{ '[quota OFF]' if not item.enabled else '' }}
+  loop: "{{ _rgw_report }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "Usage: tenants at or over 80% of a cap"
+  ansible.builtin.debug:
+    msg: >-
+      near/over quota (>=80%):
+      {{ ((_rgw_report | selectattr('size_pct', 'ne', none) | selectattr('size_pct', 'ge', 80) | map(attribute='name') | list)
+          + (_rgw_report | selectattr('objects_pct', 'ne', none) | selectattr('objects_pct', 'ge', 80) | map(attribute='name') | list))
+         | unique | default(['none'], true) }}.
+      Read-only report; no changes made.

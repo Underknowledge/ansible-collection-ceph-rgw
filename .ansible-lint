@@ -1,0 +1,11 @@
+---
+# Mirrors the kayobe-config conventions these roles are built to slot into.
+skip_list:
+  # Long lines are unavoidable in the folded `cephadm shell -- bash -c '...'` radosgw-admin command strings.
+  # Wrapping them splits the command mid-line.
+  # kayobe-config skips this too (its own .ansible-lint / .yamllint).
+  - yaml[line-length]
+  # No changelog is shipped yet. This collection is not published to Galaxy.
+  - galaxy[no-changelog]
+  # var-naming[no-role-prefix] is intentionally not skipped.
+  # Every variable is role-name-prefixed (rgw_sts_* / rgw_tenants_*), so keep this rule enforced.

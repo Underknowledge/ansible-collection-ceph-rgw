@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: rgw_tenants
+  namespace: underknowledge
+  author: Underknowledge
+  description: OIDC-federated, per-tenant S3 on Ceph RGW (accounts, roles, OIDC providers, buckets).
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: EL
+      versions:
+        - "9"
+  galaxy_tags:
+    - ceph
+    - rgw
+    - s3
+    - oidc
+    - keycloak
+    - multitenancy
+# rgw_sts must run first (STS key + S3 STS auth on), as a separate play so the RGW restart lands between them. Left out
+# of dependencies to avoid an inline double-run.
+# The cephadm chain orders the two plays. See the collection README.
+dependencies: []

@@ -1,0 +1,24 @@
+---
+# Provisioning step 4: per-tenant buckets (state: present). Included by provision.yml last, once each tenant's account-root
+# user and roles exist.
+
+# Per-tenant buckets (created as that account-root) Buckets belong to a user in RGW, so each tenant's
+# buckets are created with its account-root keys (via env). Idempotent: only BucketAlreadyOwnedByYou
+# counts as success.
+- name: Create each tenant's buckets as its account-root
+  ansible.builtin.command: "python3 /var/run/ceph/{{ _rgw_tenants_fsid }}/manage_buckets.py"
+  environment:
+    S3_ENDPOINT: "{{ rgw_tenants_endpoint }}"
+    AWS_REGION: "{{ rgw_tenants_s3_region }}"
+    BUCKETS: "{{ item.buckets | default([]) | join(',') }}"
+    AWS_ACCESS_KEY_ID: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_access_key') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.name }}: {{ item.buckets | default([]) | join(', ') }}"
+  register: rgw_tenants_bucket_reg
+  changed_when: "'CREATED' in rgw_tenants_bucket_reg.stdout"
+  no_log: true
+  when:
+    - item.buckets | default([]) | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host

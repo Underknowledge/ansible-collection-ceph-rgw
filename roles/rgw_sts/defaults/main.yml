@@ -1,0 +1,29 @@
+---
+# Defaults for the rgw_sts role. Override these in your kayobe environment (environments/<env>/cephadm.yml). Keep
+# the signing key in your vault.
+#
+# This role configures native RGW STS, no Keystone: the session-token signing key, STS auth on the S3 endpoint, and the
+# IAM roles that AssumeRole / GetSessionToken resolve. OIDC web-identity federation is handled by the rgw_tenants role,
+# which registers providers via the IAM API (squid requires this, radosgw-admin cannot).
+
+# Host that owns the cephadm bootstrap keyring.
+# All radosgw-admin/ceph work runs there.
+rgw_sts_bootstrap_host: "{{ groups['mons'][0] }}"
+
+# fsid of the running cluster. Empty => the role discovers it via `cephadm shell -- ceph fsid`.
+# Redeclared here because role defaults are in scope only during the role's own play,
+# and the `when: rgw_sts_fsid | length == 0` guard needs it defined.
+rgw_sts_fsid: ""
+
+# The cephadm RGW service to restart when the STS runtime config changes.
+# Name depends on how the RGW service spec was named at deploy. Check `ceph orch ls --service-type rgw`.
+rgw_sts_service_name: "rgw.rgw"
+
+# Empty => skip setting rgw_sts_key (leaves Ceph's insecure built-in default "sts"). Supply a strong secret from your
+# vault (16+ random chars recommended).
+rgw_sts_key: ""
+
+# Standalone IAM roles for AssumeRole / GetSessionToken. The web-identity tenant roles are provisioned by
+# rgw_tenants. Each item:
+#   { name, account_id (optional), trust_policy: <doc>, policies: [ { name, document: <doc> } ] }
+rgw_sts_roles: []

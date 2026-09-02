@@ -1,0 +1,54 @@
+---
+# Read-only drift preview. Included by main.yml when rgw_tenants_plan is true. main.yml then ends the play. For
+# every configured tenant it reports what a real run would change: create account/user/role/bucket, move a
+# quota/limit, or decommission.
+# Changes nothing on the cluster. Every radosgw-admin call is a get/list/info/stats.
+# _rgw_tenants_fsid is set by main.yml before this is included.
+
+- name: Stage the plan helper
+  ansible.builtin.copy:
+    src: plan_tenants.py
+    dest: "/var/run/ceph/{{ _rgw_tenants_fsid }}/plan_tenants.py"
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
+# The helper runs inside `cephadm shell`, which does not carry the host env
+# into the container. Pass the desired config through a file in the bind-mounted fsid dir.
+- name: Stage the plan input (desired tenants + tiers)
+  ansible.builtin.copy:
+    content: "{{ {'desired': rgw_tenants_list, 'tiers': rgw_tenants_tiers | map(attribute='name') | list} | to_json }}"
+    dest: "/var/run/ceph/{{ _rgw_tenants_fsid }}/plan_input.json"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+
+- name: Compute the drift plan (read-only)
+  ansible.builtin.command: cephadm shell -- python3 /var/run/ceph/plan_tenants.py
+  register: _rgw_plan_out
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Parse the plan
+  ansible.builtin.set_fact:
+    _rgw_plan: "{{ (_rgw_plan_out.stdout | from_json).tenants }}"
+
+- name: "Plan: per tenant"
+  ansible.builtin.debug:
+    msg: >-
+      {{ item.name }} ({{ item.account_id }}) [{{ item.state }}]:
+      {{ item.changes if item.changes else ['up to date (no changes)'] }}
+  loop: "{{ _rgw_plan }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "Plan: summary"
+  ansible.builtin.debug:
+    msg: >-
+      {{ _rgw_plan | length }} tenants:
+      {{ _rgw_plan | selectattr('changes', 'defined') | selectattr('changes') | list | length }} would change,
+      {{ _rgw_plan | rejectattr('changes') | list | length }} up to date.
+      No cluster changes made (read-only preview).

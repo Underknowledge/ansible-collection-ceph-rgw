@@ -1,0 +1,268 @@
+---
+argument_specs:
+  main:
+    short_description: Provision OIDC-federated, per-tenant S3 on Ceph RGW.
+    description:
+      - Creates an RGW account, account-root user,
+        OIDC provider, per-tier IAM roles, and buckets for each tenant. Run after the rgw_sts role.
+    options:
+      rgw_tenants_endpoint:
+        type: str
+        required: false
+        description: RGW S3/IAM/STS endpoint reachable from the bootstrap host.
+      rgw_tenants_dir:
+        type: str
+        required: false
+        default: ""
+        description: >-
+          Optional control-host directory of drop-in tenant files (*.yml/*.yaml).
+          Each holds a per-tenant rgw_tenant_<name> config dict plus its vault_rgw_tenants_<name>_* keys
+          (inline !vault), together. The role loads the dir and appends each rgw_tenant_* to rgw_tenants_list.
+          Empty => not loaded. The rgw_new_tenant playbook generates these.
+      rgw_tenants_s3_region:
+        type: str
+        required: false
+        default: us-east-1
+        description: >-
+          AWS region string boto3 sends to RGW (SigV4 signing placeholder, not a cloud region).
+          Keep us-east-1 unless a zonegroup api_name is set:
+          it is the only region for which boto3 omits CreateBucket's LocationConstraint.
+      rgw_tenants_default_quota:
+        type: dict
+        required: false
+        description: >-
+          Fallback storage quota for tenants that omit their own quota ({enabled, max_size, max_objects}).
+          Default {} = leave such tenants at RGW's unlimited default.
+      rgw_tenants_list:
+        type: list
+        elements: dict
+        required: false
+        description: The tenants to provision.
+        options:
+          name:
+            type: str
+            required: true
+            description: Tenant slug; must be [a-z0-9]+ (account-root uid + default bucket prefix).
+          account_id:
+            type: str
+            required: true
+            description: RGW account id, "RGW" + 17 digits.
+          state:
+            type: str
+            required: false
+            default: present
+            choices: [present, absent]
+            description: >-
+              present provisions the tenant.
+              absent decommissions it (removes buckets, OIDC provider, tier roles, account-root user, and the account, idempotently).
+          buckets:
+            type: list
+            elements: str
+            required: false
+            description: Bucket names to create; each must start with the tier prefix.
+          purge_objects:
+            type: bool
+            required: false
+            default: false
+            description: >-
+              With state=absent, the destroy-data gate: delete non-empty buckets (bucket rm --purge-objects)
+              and cascade the account removal (account rm --purge-data) so tenant-created residue goes too.
+              Without it, non-empty buckets or a non-empty account fail the run instead of destroying data.
+          rotate_keys:
+            type: bool
+            required: false
+            default: false
+            description: >-
+              Roll this tenant's account-root S3 keys to the current vaulted value
+              (per-tenant equivalent of rgw_tenants_rotate_keys). Off by default, idempotent while on.
+          limits:
+            type: dict
+            required: false
+            description: Per-account entity cap (distinct from the storage quota). Omit for RGW defaults.
+            options:
+              max_users:
+                type: raw
+                required: false
+                default: -1
+                description: Max users in the account (or -1 = unlimited).
+              max_buckets:
+                type: raw
+                required: false
+                default: -1
+                description: Max buckets in the account (or -1 = unlimited).
+          quota:
+            type: dict
+            required: false
+            description: Per-account storage cap (increase/decrease/limit). Omit for unlimited.
+            options:
+              enabled:
+                type: bool
+                required: false
+                default: false
+                description: Whether the quota is enforced.
+              max_size:
+                type: raw
+                required: false
+                default: -1
+                description: Max bytes (or -1 = unlimited).
+              max_objects:
+                type: raw
+                required: false
+                default: -1
+                description: Max object count (or -1 = unlimited).
+          root_user:
+            type: str
+            required: false
+            description: >-
+              Primary account-root uid (default "<name>root";
+              the rgw_new_tenant playbook writes the iam-<name>-root convention). uid == display-name; [a-z0-9_-].
+          bucket_prefix:
+            type: str
+            required: false
+            description: S3 ARN prefix the tier policies scope to (default "<name>-").
+          root_users:
+            type: list
+            elements: dict
+            required: false
+            description: >-
+              Additional account-root users (management/service/personal) the operator adds over the tenant's life.
+              Each becomes uid == display-name ==
+              iam-<name>-root-<this.name>; its keys are vault_rgw_tenants_<name>_root_<this.name>_*.
+              Buckets are account-owned, so add or remove one without touching tenant data.
+            options:
+              name:
+                type: str
+                required: true
+                description: >-
+                  Descriptor slug, [a-z0-9_]+ (sanitize person names with the ceph_descriptor filter).
+                  Forms the uid iam-<tenant>-root-<name>.
+              state:
+                type: str
+                required: false
+                default: present
+                choices: [present, absent]
+                description: present creates the root user;
+                  absent removes it (user rm), gated by rgw_tenants_allow_root_user_removal.
+              suspended:
+                type: bool
+                required: false
+                default: false
+                description: Reconciled every converge via radosgw-admin user suspend/enable.
+      rgw_tenants_oidc:
+        type: dict
+        required: false
+        description: The OIDC realm to federate.
+        options:
+          provider_url:
+            type: str
+            required: true
+            description: Token issuer URL incl. https:// (the JWT iss).
+          client_ids:
+            type: list
+            elements: str
+            required: true
+            description: Accepted audiences (the RGW-facing OIDC client id(s)).
+          thumbprints:
+            type: list
+            elements: str
+            required: true
+            description: SHA1 hex (40 chars) of the JWKS signing cert.
+      rgw_tenants_tiers:
+        type: list
+        elements: dict
+        required: false
+        description: Tier name to S3 actions (defaults admin/writer/reader).
+        options:
+          name:
+            type: str
+            required: true
+            description: Tier name; the role is named "<tenant>-<name>".
+          actions:
+            type: list
+            elements: str
+            required: true
+            description: S3 actions the tier's permission policy allows.
+      rgw_tenants_rotate_keys:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Global gate for rolling every tenant's account-root S3 keys to the vaulted value.
+          Off so a converge run never rotates live credentials.
+          Turn on to rotate, then off.
+      rgw_tenants_prune_roles:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Global gate for deleting each present tenant's "<name>-<tier>" roles
+          whose tier is no longer in rgw_tenants_tiers. Off by default (it deletes IAM roles).
+      rgw_tenants_allow_teardown:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Global gate that must be true for the state: absent decommission path to run.
+          Off so a scheduled converge never deletes a tenant from a committed `state: absent`;
+          an operator runs teardown deliberately with -e rgw_tenants_allow_teardown=true.
+      rgw_tenants_allow_purge:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Second gate for destroying data during teardown;
+          a tenant's purge_objects only takes effect when this is also true.
+          Otherwise a non-empty bucket/account fails the run.
+      rgw_tenants_allow_root_user_removal:
+        type: bool
+        required: false
+        default: true
+        description: >-
+          Honor a root_users entry marked state: absent by running user rm on the next converge.
+          Default true (removing a root user destroys no data; buckets are account-owned).
+          Set false to recognise-but-skip absent root users.
+      rgw_tenants_service_name:
+        type: str
+        required: false
+        description: cephadm RGW service to restart on OIDC change (default rgw.rgw).
+      rgw_tenants_bootstrap_host:
+        type: str
+        required: false
+        description: Host that runs the ceph commands (default groups['mons'][0]).
+      rgw_tenants_fsid:
+        type: str
+        required: false
+        description: Cluster fsid. Empty discovers it via ceph fsid.
+      rgw_tenants_plan:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Opt-in read-only drift preview.
+          When true the role reports what a real run would change for each configured tenant
+          (create/quota/limits/roles/buckets/decommission) and ends the play without provisioning.
+          Changes nothing on the cluster.
+      rgw_tenants_report:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Opt-in read-only usage report.
+          When true the role prints each configured tenant's used storage size/objects against its account quota
+          and ends the play without provisioning. Changes nothing on the cluster.
+      rgw_tenants_discover:
+        type: bool
+        required: false
+        default: false
+        description: >-
+          Opt-in read-only brownfield discovery.
+          When true the role inventories every RGW account, classifies each managed-vs-unmanaged against rgw_tenants_list,
+          writes an adoption stub per unmanaged account to rgw_tenants_discover_output_dir,
+          and ends the play without provisioning. Changes nothing on the cluster.
+      rgw_tenants_discover_output_dir:
+        type: str
+        required: false
+        description: >-
+          Control-host directory for discovery adoption stubs
+          (default "{{ playbook_dir }}/rgw-tenants-discovery").
+          One adopt-<account-id>.yml per unmanaged account.

@@ -1,0 +1,36 @@
+---
+# Ansible collection metadata. Built and pulled by kayobe as a git source, the same way this repo's kayobe-config pulls
+# ansible-collection-cephadm. See README.md.
+namespace: underknowledge
+name: ceph_rgw
+version: 0.1.0
+readme: README.md
+authors:
+  - Underknowledge
+description: >-
+  Native Ceph RGW STS plus OIDC-federated, per-tenant S3 for kayobe/cephadm deployments.
+  rgw_sts enables native STS: session-token signing key, S3 STS auth, IAM roles, OIDC providers.
+  rgw_tenants provisions each tenant as a dedicated RGW account with an account-root user,
+  a registered OIDC provider, per-tier web-identity IAM roles, and buckets.
+license:
+  - Apache-2.0
+tags:
+  - storage
+  - security
+  - ceph
+  - rgw
+  - s3
+  - sts
+  - oidc
+  - multitenancy
+  - kayobe
+  - cephadm
+repository: https://github.com/Underknowledge/ansible-collection-ceph-rgw
+issues: https://github.com/Underknowledge/ansible-collection-ceph-rgw/issues
+build_ignore:
+  - examples
+  - .git
+  - .github
+  - "*.tar.gz"
+  - "__pycache__"
+  - "*.pyc"

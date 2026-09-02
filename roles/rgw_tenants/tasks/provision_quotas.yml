@@ -1,0 +1,87 @@
+---
+# Provisioning step 2: per-tenant account quotas + entity limits (state: present). Included by provision.yml after the
+# account/user identity is in place. Both tasks are opt-in per tenant (quota / limits keys) and idempotent (apply only on
+# drift).
+
+# Per-tenant account storage quota (size/object cap) Raise, lower, or lift a tenant's storage ceiling by editing
+# item.quota and re-running. max_size is in bytes (or -1 = unlimited), max_objects is a count (or -1), enabled
+# toggles enforcement. Idempotent: reads the account's current quota via python3 in
+# the cephadm image, applies only on drift, reports CHANGED only when it changed.
+# The effective quota is the tenant's own `quota` or, when it omits one, the role-wide rgw_tenants_default_quota
+# fallback; when both are empty the account is left untouched (RGW default = unlimited).
+- name: Set + toggle per-tenant account storage quota
+  vars:
+    _q: "{{ item.quota | default(rgw_tenants_default_quota, true) }}"
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        acct=$1; size=$2; objs=$3; want=$4
+        cur=$(radosgw-admin account get --account-id="$acct" \
+          | python3 -c 'import sys,json; q=json.load(sys.stdin).get("quota",{}); print(q.get("max_size","?"), q.get("max_objects","?"), "enable" if q.get("enabled") else "disable")')
+        set -- $cur; cs=$1; co=$2; ce=$3
+        if [ "$cs" = "$size" ] && [ "$co" = "$objs" ] && [ "$ce" = "$want" ]; then
+          echo OK
+        else
+          radosgw-admin quota set --quota-scope=account --account-id="$acct" \
+            --max-size="$size" --max-objects="$objs" >/dev/null &&
+          radosgw-admin quota "$want" --quota-scope=account --account-id="$acct" >/dev/null &&
+          echo CHANGED
+        fi
+      - _
+      - "{{ item.account_id }}"
+      - "{{ _q.max_size | default(-1) }}"
+      - "{{ _q.max_objects | default(-1) }}"
+      - "{{ 'enable' if (_q.enabled | default(false)) else 'disable' }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.name }}: size={{ _q.max_size | default(-1) }} objs={{ _q.max_objects | default(-1) }} ({{ 'on' if (_q.enabled | default(false)) else 'off' }})"
+  register: rgw_tenants_quota_reg
+  changed_when: "'CHANGED' in rgw_tenants_quota_reg.stdout"
+  become: true
+  when:
+    - (item.quota | default(rgw_tenants_default_quota, true)) | length > 0
+    - inventory_hostname == rgw_tenants_bootstrap_host
+
+# Per-tenant account entity limits (max users / max buckets) Distinct from the storage quota above. Caps how many users and
+# buckets the account may hold
+# (radosgw-admin account modify --max-users/--max-buckets). -1 = unlimited.
+# Tenants with no `limits` key stay at the RGW account defaults. Idempotent: reads the account's
+# current caps and applies only on drift. max_users/max_buckets are top-level fields of `account get`,
+# mirroring the modify flags. Reports CHANGED only when moved.
+- name: Reconcile per-tenant account entity limits (users/buckets)
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        acct=$1; mu=$2; mb=$3
+        cur=$(radosgw-admin account get --account-id="$acct" \
+          | python3 -c 'import sys,json; a=json.load(sys.stdin); print(a.get("max_users","?"), a.get("max_buckets","?"))')
+        set -- $cur; cmu=$1; cmb=$2
+        if [ "$cmu" = "$mu" ] && [ "$cmb" = "$mb" ]; then
+          echo OK
+        else
+          radosgw-admin account modify --account-id="$acct" \
+            --max-users="$mu" --max-buckets="$mb" >/dev/null && echo CHANGED
+        fi
+      - _
+      - "{{ item.account_id }}"
+      - "{{ item.limits.max_users | default(-1) }}"
+      - "{{ item.limits.max_buckets | default(-1) }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.name }}: max_users={{ item.limits.max_users | default(-1) }} max_buckets={{ item.limits.max_buckets | default(-1) }}"
+  register: rgw_tenants_limits_reg
+  changed_when: "'CHANGED' in rgw_tenants_limits_reg.stdout"
+  become: true
+  when:
+    - item.limits is defined
+    - inventory_hostname == rgw_tenants_bootstrap_host

@@ -1,0 +1,17 @@
+---
+# Read-only verification of the tenant provisioning (accounts, per-tier roles, buckets). Needs no IdP and no user
+# password. Run on demand, not in the deploy chain:
+#   kayobe playbook run .../ansible/ceph/cephadm-tenants-verify.yml
+# For the full federation path (login -> assume -> scoped S3),
+# run roles/rgw_tenants/files/verify_federation.py per user (see the collection README).
+- name: Verify Ceph RGW tenants
+  gather_facts: false
+  hosts: mons
+  become: true
+  tags:
+    - cephadm-tenants-verify
+  tasks:
+    - name: Run rgw_tenants read-only verification
+      ansible.builtin.import_role:
+        name: underknowledge.ceph_rgw.rgw_tenants
+        tasks_from: verify

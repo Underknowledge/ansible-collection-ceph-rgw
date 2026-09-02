@@ -1,0 +1,11 @@
+---
+# Add these two imports to the end of etc/kayobe/ansible/ceph/cephadm.yml,
+# after the existing "Import Cephadm commands post playbook" line. Order matters:
+#   - STS after commands-post (it sets rgw_sts_key / rgw_s3_auth_use_sts + restarts RGW)
+#   - tenants last (needs STS on + registers per-account OIDC providers, restarts RGW)
+
+- name: Import Cephadm STS playbook
+  import_playbook: cephadm-sts.yml
+
+- name: Import Cephadm tenants (multi-tenant S3) playbook
+  import_playbook: cephadm-tenants.yml

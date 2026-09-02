@@ -1,0 +1,25 @@
+---
+galaxy_info:
+  role_name: rgw_sts
+  namespace: underknowledge
+  author: Underknowledge
+  description: Native Ceph RGW STS - signing key, S3 STS auth, IAM roles, OIDC providers.
+  license: Apache-2.0
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - jammy
+        - noble
+    - name: EL
+      versions:
+        - "9"
+  galaxy_tags:
+    - ceph
+    - rgw
+    - sts
+    - s3
+    - iam
+# No hard role dependencies. rgw_tenants consumes what this sets up.
+# The two run as separate plays in the cephadm chain, with an RGW restart between. Run rgw_sts first.
+dependencies: []

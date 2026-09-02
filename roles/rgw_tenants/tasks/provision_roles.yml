@@ -1,0 +1,101 @@
+---
+# Provisioning step 3: OIDC federation + per-tier IAM roles (state: present). Included by provision.yml after
+# accounts/quotas. Registers the OIDC realm as a provider in each tenant account, provisions one <tenant>-<tier> role per
+# tenant x tier, and, when gated, prunes tier roles left orphaned by a removed or renamed tier.
+
+# Register the OIDC realm as a provider in each tenant account
+# Ceph squid has no working `radosgw-admin oidc-provider`. Providers are IAM resources
+# scoped to the calling account, so register once per tenant as that account-root. Creds go via the environment, not argv.
+# The helper validates thumbprints and rolls back on a failed replace.
+- name: Register the OIDC realm as a provider per tenant
+  ansible.builtin.command: "python3 /var/run/ceph/{{ _rgw_tenants_fsid }}/manage_oidc_provider.py"
+  environment:
+    IAM_ENDPOINT: "{{ rgw_tenants_endpoint }}"
+    AWS_REGION: "{{ rgw_tenants_s3_region }}"
+    OIDC_PROVIDER_URL: "{{ rgw_tenants_oidc.provider_url }}"
+    OIDC_CLIENT_IDS: "{{ rgw_tenants_oidc.client_ids | join(',') }}"
+    OIDC_THUMBPRINTS: "{{ rgw_tenants_oidc.thumbprints | join(',') }}"
+    AWS_ACCESS_KEY_ID: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_access_key') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.account_id }})"
+  register: rgw_tenants_oidc_reg
+  changed_when: "'CREATED' in rgw_tenants_oidc_reg.stdout or 'REPLACED' in rgw_tenants_oidc_reg.stdout"
+  no_log: true
+  notify: Restart RGW for OIDC
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+# Per-tenant-tier IAM roles (federated web-identity): create or trust-update One <tenant>-<tier> role per tenant x tier. The boto3
+# helper is idempotent: create if absent, UpdateAssumeRolePolicy on trust drift, always (re)put the permission policy. Trust and
+# permission docs render from the templates and pass via the environment. No on-disk JSON, no shell interpolation of policy
+# bodies.
+- name: Compute the OIDC provider host (provider_url minus scheme)
+  ansible.builtin.set_fact:
+    _rgw_tenants_provider_host: "{{ rgw_tenants_oidc.provider_url | regex_replace('^https?://', '') }}"
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Build the tenant x tier role matrix
+  ansible.builtin.set_fact:
+    _rgw_tenants_role_matrix: >-
+      {{ _rgw_tenants_role_matrix | default([])
+         + [{'tenant': item.0, 'tier': item.1, 'name': item.0.name ~ '-' ~ item.1.name}] }}
+  loop: "{{ _rgw_tenants_present | product(rgw_tenants_tiers) | list }}"
+  loop_control:
+    label: "{{ item.0.name }}-{{ item.1.name }}"
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+- name: Provision each tenant-tier IAM role (create + trust-update + permission policy)
+  ansible.builtin.command: "python3 /var/run/ceph/{{ _rgw_tenants_fsid }}/manage_role.py"
+  environment:
+    IAM_ENDPOINT: "{{ rgw_tenants_endpoint }}"
+    AWS_REGION: "{{ rgw_tenants_s3_region }}"
+    ROLE_NAME: "{{ item.name }}"
+    TRUST_DOC: "{{ lookup('template', 'tenant-trust.json.j2') }}"
+    PERM_DOC: "{{ lookup('template', 'tenant-perm.json.j2') }}"
+    POLICY_NAME: tenant
+    AWS_ACCESS_KEY_ID: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.tenant.name ~ '_access_key') }}"
+    AWS_SECRET_ACCESS_KEY: "{{ lookup('vars', 'vault_rgw_tenants_' ~ item.tenant.name ~ '_secret_key') }}"
+  loop: "{{ _rgw_tenants_role_matrix }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: rgw_tenants_role_reg
+  changed_when: "'CREATED' in rgw_tenants_role_reg.stdout or 'UPDATED-TRUST' in rgw_tenants_role_reg.stdout"
+  no_log: true
+  when: inventory_hostname == rgw_tenants_bootstrap_host
+
+# Prune orphaned tier roles (gated) Removing or renaming a tier in rgw_tenants_tiers leaves each present tenant's old
+# "<name>-<tier>" role behind (the provisioning loop only adds). When rgw_tenants_prune_roles is on, delete any role under
+# this tenant's own "<name>-" prefix that is not a current tier. Off by default because it deletes IAM roles. Only touches
+# the tenant's own namespace, never other accounts' roles. Idempotent: CHANGED only when it removes something.
+- name: Prune orphaned tenant-tier IAM roles (gated)
+  ansible.builtin.command:
+    argv:
+      - cephadm
+      - shell
+      - --
+      - bash
+      - -c
+      - |
+        acct=$1; prefix=$2; keep=$3
+        changed=no
+        for r in $(radosgw-admin role list --account-id="$acct" | python3 -c 'import sys,json; d=json.load(sys.stdin); rs=d if isinstance(d,list) else d.get("Roles",[]); [print(x.get("RoleName") or x.get("role_name") or x.get("name","")) for x in rs]'); do
+          case "$r" in "$prefix"*) : ;; *) continue ;; esac
+          case ",$keep," in *",$r,"*) continue ;; esac
+          radosgw-admin role-policy delete --role-name="$r" --account-id="$acct" --policy-name=tenant >/dev/null 2>&1 || true
+          radosgw-admin role delete --role-name="$r" --account-id="$acct" >/dev/null && changed=yes
+        done
+        [ "$changed" = yes ] && echo CHANGED || echo OK
+      - _
+      - "{{ item.account_id }}"
+      - "{{ item.name }}-"
+      - "{{ rgw_tenants_tiers | map(attribute='name') | map('regex_replace', '^', item.name ~ '-') | join(',') }}"
+  loop: "{{ _rgw_tenants_present }}"
+  loop_control:
+    label: "{{ item.name }} (keep {{ rgw_tenants_tiers | map(attribute='name') | join('/') }})"
+  register: rgw_tenants_prune_reg
+  changed_when: "'CHANGED' in rgw_tenants_prune_reg.stdout"
+  become: true
+  when:
+    - rgw_tenants_prune_roles | default(false) | bool
+    - inventory_hostname == rgw_tenants_bootstrap_host

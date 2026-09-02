@@ -1,0 +1,4 @@
+---
+# Minimum Ansible for FQCN role addressing (underknowledge.ceph_rgw.<role>) and the filters/modules these roles use. Kayobe
+# 2024.1/2025.1 ship well above this floor.
+requires_ansible: ">=2.15.0"

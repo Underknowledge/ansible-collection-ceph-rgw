@@ -1,0 +1,75 @@
+---
+# Example RGW STS + tenants configuration. Merge these keys into your kayobe environment's cephadm.yml
+# (e.g. environments/<env>/cephadm.yml). Everything here is non-secret. The account-root S3 keys live in
+# the vault (see secrets.yml example).
+
+# rgw_sts (native STS) The STS session-token signing key. Reference the vaulted value. Never inline it.
+rgw_sts_key: "{{ vault_rgw_sts_key }}"
+
+# Standalone AssumeRole / GetSessionToken IAM roles are optional and usually empty. The tenants layer generates the web-identity
+# roles. Populate only for non-tenant STS.
+rgw_sts_roles: []
+
+# service_name / bootstrap_host / fsid are per-role. Each role owns its own prefixed copy. Set the
+# rgw_sts_* and rgw_tenants_* variants below only to override the defaults (service_name defaults to
+# rgw.rgw, fsid auto-discovers, bootstrap_host defaults to the first mon).
+# Override if your RGW cephadm service is not named "rgw.rgw" (ceph orch ls --service-type rgw).
+# Set both so the two roles stay in agreement: rgw_sts_service_name: "rgw.default"
+# rgw_tenants_service_name: "rgw.default"
+
+# rgw_tenants (multi-tenant S3) RGW S3/IAM/STS endpoint the bootstrap host can reach.
+rgw_tenants_endpoint: "http://ceph-rgw.internal.example:8080"
+
+# The OIDC realm that mints web-identity tokens (Keycloak here). provider_url is the token issuer (`iss`).
+# client_ids are accepted audiences. thumbprints are the SHA1 hex of the JWKS signing cert (use=sig key's x5c), not
+# the IdP TLS chain. Recompute from <issuer>/protocol/openid-connect/certs whenever the realm signing key rotates.
+rgw_tenants_oidc:
+  provider_url: "https://idp.example.com/realms/myrealm"
+  client_ids: ["ceph-s3"]
+  # Compute the real value (the role rejects this CHANGEME sentinel, since it is not 40-hex):
+  #   curl -s https://idp.example.com/realms/myrealm/protocol/openid-connect/certs \
+  #     | python3 -c 'import sys,json,base64,hashlib; \
+  #       k=[k for k in json.load(sys.stdin)["keys"] if k.get("use")=="sig"][0]; \
+  #       der=base64.b64decode(k["x5c"][0]); print(hashlib.sha1(der).hexdigest())'
+  thumbprints: ["CHANGEME-40-hex-sha1-of-the-jwks-signing-cert"]
+
+# Optional: reshape the tiers. Defaults are admin (s3:*) / writer / reader. rgw_tenants_tiers:
+#   - { name: admin,  actions: ["s3:*"] }
+#   - { name: writer, actions: ["s3:ListBucket","s3:GetObject","s3:PutObject","s3:DeleteObject"] }
+#   - { name: reader, actions: ["s3:ListBucket","s3:GetObject"] }
+
+# Day-to-day gates (default off, converges on a schedule). Flip on for a single run, then back off.
+# rotate_keys rolls every tenant's account-root key to the vaulted value. prune_roles deletes <name>-<tier>
+# roles whose tier you removed from rgw_tenants_tiers. rgw_tenants_rotate_keys: true rgw_tenants_prune_roles:
+# true
+
+# One entry per tenant. account_id = "RGW" + 17 digits (unique, stable). Each gets an account, an
+# account-root user (uid "<name>root" unless root_user overrides), a registered OIDC provider, <name>-<tier>
+# roles, and the listed buckets. quota (storage) and limits (users/buckets) are optional. Edit and re-run.
+# max_size is BYTES or -1. Let kayobe compute readable sizes.
+rgw_tenants_list:
+  - name: acme
+    account_id: "RGW00000000000000001"
+    buckets: ["acme-data", "acme-logs", "acme-backups"]
+    quota:
+      enabled: true
+      max_size: "{{ 500 * 1024 ** 3 }}" # 500 GiB
+      max_objects: -1                    # no object-count cap
+    limits:
+      max_users: 20                      # cap account users (-1 = unlimited)
+      max_buckets: 50                    # cap account buckets (-1 = unlimited)
+    # rotate_keys: true                  # roll THIS tenant's key once (also needs the vault key changed)
+  - name: globex
+    account_id: "RGW00000000000000002"
+    buckets: ["globex-data", "globex-logs"]
+    # quota: omitted -> unlimited
+    # limits: omitted -> RGW account defaults
+    # root_user: globexadmin           # optional override
+    # bucket_prefix: "globex-"         # optional; defaults to "<name>-"
+
+  # Decommission: keep the entry with state: absent (and its vault keys) until the run reports all OK, then delete both. A
+  # non-empty bucket needs purge_objects: true. - name: initech
+  #   account_id: "RGW00000000000000003"
+  #   state: absent
+  #   buckets: ["initech-data"]        # listed so they get removed
+  #   purge_objects: true              # only if the buckets still hold data (destructive)

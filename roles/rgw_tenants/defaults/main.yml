@@ -1,0 +1,175 @@
+---
+# Defaults for the rgw_tenants role: OIDC-federated, multi-tenant S3 on Ceph RGW. Override in your kayobe environment
+# (environments/<env>/cephadm.yml). Keep per-tenant account-root S3 keys in your vault as
+# vault_rgw_tenants_<name>_access_key / _secret_key.
+#
+# The role gives each tenant a dedicated RGW account (fixed id so role ARNs are known from config), an account-root user
+# (creates buckets, never handed to end users), its buckets, a registered OIDC provider, and the per-tier IAM roles
+# assumed via OIDC web-identity. Run after rgw_sts (the STS key and auth must be on first).
+
+# Host that owns the cephadm bootstrap keyring. All radosgw-admin/ceph work runs there.
+rgw_tenants_bootstrap_host: "{{ groups['mons'][0] }}"
+rgw_tenants_fsid: ""
+
+# Drop-in tenant directory (optional). When set to a path on the control host, the role loads every
+# *.yml/*.yaml in it and appends what it finds to rgw_tenants_list, so a tenant is added by dropping one
+# self-contained file and removed by deleting it. Each file holds both the non-secret config and the vaulted
+# account-root keys:
+#
+#   # rgw_tenants.d/<name>.yml
+#   rgw_tenant_<name>:                 # the list entry, under a per-tenant key
+#     name: <name>
+#     account_id: "RGW00000000000000001"
+#     buckets: [<name>-data, <name>-logs, <name>-backups]
+#     quota: { enabled: true, max_size: 1099511627776, max_objects: -1 }
+#   vault_rgw_tenants_<name>_access_key: !vault |   # the keys the role already looks up
+#     $ANSIBLE_VAULT;1.1;AES256;...                 # by name -- no separate secrets file
+#   vault_rgw_tenants_<name>_secret_key: !vault |
+#     $ANSIBLE_VAULT;1.1;AES256;...
+#
+# The rgw_new_tenant playbook generates exactly this file. Drop-ins are appended to any inline rgw_tenants_list, so use one
+# mechanism or the other per tenant (a name defined in both is provisioned twice). Empty => the dir is not loaded.
+rgw_tenants_dir: ""
+
+# Brownfield discovery / adoption (opt-in, read-only) When true, the role runs discovery instead of
+# provisioning: inventories every RGW account on the cluster, classifies each as managed (its
+# account_id is already in rgw_tenants_list) or unmanaged, and writes an adoption stub for each
+# unmanaged account to rgw_tenants_discover_output_dir on the control host. Changes nothing on the
+# cluster and skips all provisioning and teardown. Use it once to bring a pre-existing cluster under
+# management: review a stub, add the account-root's existing S3 keys to your vault as
+# vault_rgw_tenants_<name>_access_key/_secret_key, merge the entry into rgw_tenants_list, then run the
+# role normally. Usually set per-run with -e rgw_tenants_discover=true.
+rgw_tenants_discover: false
+rgw_tenants_discover_output_dir: "{{ playbook_dir }}/rgw-tenants-discovery"
+
+# Drift preview (opt-in, read-only) When true, the role reports what a real run would change for each
+# configured tenant (create account/user/role/bucket, move a quota/limit, or decommission) and ends the
+# play without touching the cluster.
+# Use it as a dry-run before editing rgw_tenants_list. Read-only: only radosgw-admin get/list/info/stats.
+# The OIDC provider and policy bodies are reconciled on apply (they need account-root keys) and are not
+# previewed. Usually set per-run with -e rgw_tenants_plan=true.
+rgw_tenants_plan: false
+
+# Usage report (opt-in, read-only) When true, print each configured tenant's used storage size/objects against its account
+# quota (with a percentage when the cap is finite) and end the play without provisioning. Uses the cached account stats (no
+# --sync-stats recompute). Set with -e rgw_tenants_report=true.
+rgw_tenants_report: false
+
+# Day-to-day gates (the role converges on a schedule, e.g. hourly) Everything the role does is idempotent, so re-running
+# never drifts. Two classes of change are dangerous to do automatically on every tick, so they are gated off by default and
+# only happen when you opt in:
+#
+# rgw_tenants_rotate_keys: roll each tenant's account-root S3 keys to the current vaulted value.
+#   Off by default so a routine converge run never rotates live credentials.
+#   To rotate: change vault_rgw_tenants_<name>_access_key/_secret_key, set this true (globally)
+#   or item.rotate_keys: true (one tenant), run once, then set it back to false.
+#   It stays idempotent while true (rotates only on drift between vault and server).
+#   Leaving it on does no harm. Turning it back off keeps the set of affected credentials explicit.
+rgw_tenants_rotate_keys: false
+#
+# rgw_tenants_prune_roles: delete a tenant's "<name>-<tier>" IAM roles whose tier is no longer
+#   in rgw_tenants_tiers (drift left behind when you remove or rename a tier).
+#   Off by default because it deletes IAM roles.
+#   Turn it on when you reshape tiers and want the orphans removed.
+#   Only ever touches roles under a managed tenant's own name prefix.
+rgw_tenants_prune_roles: false
+#
+# rgw_tenants_allow_teardown: actually run the state: absent decommission path.
+#   Off by default so a scheduled converge never deletes a tenant just because
+#   someone committed `state: absent` to group_vars.
+#   The absent entries are recognized but skipped until an operator runs deliberately
+#   with `-e rgw_tenants_allow_teardown=true`. Same gating idiom as rotate/prune, applied to the most destructive path.
+rgw_tenants_allow_teardown: false
+#
+# rgw_tenants_allow_purge: second gate for destroying data during teardown.
+#   Even with allow_teardown on, a tenant's purge_objects takes effect only when this is also true.
+#   Otherwise a non-empty bucket/account fails the run instead of being purged.
+#   Keeps "delete the tenant" and "destroy its data" as two separate, explicit decisions.
+rgw_tenants_allow_purge: false
+#
+# rgw_tenants_allow_root_user_removal: honor a root_users entry marked state: absent
+#   by running `radosgw-admin user rm` on the next converge.
+#   Default true: removing an account-root user destroys no data (buckets are owned by the account, not the uid),
+#   so an offboard is safe to apply immediately.
+#   Set false to recognise-but-skip absent root users (warn only),
+#   like the tenant teardown gate, if removals should need a deliberate run.
+rgw_tenants_allow_root_user_removal: true
+
+# The cephadm RGW service to restart after an OIDC provider change (RGW caches the provider in memory).
+# Name depends on how the RGW service spec was named at deploy.
+# Check `ceph orch ls --service-type rgw` and override if it is not literally "rgw.rgw".
+rgw_tenants_service_name: "rgw.rgw"
+
+# RGW S3/IAM endpoint the bootstrap host can reach (boto3 talks S3 + IAM + STS here), e.g. http://<rgw-vip>:8080.
+# The region the helpers send is rgw_tenants_s3_region.
+rgw_tenants_endpoint: ""
+
+# The AWS region string boto3 sends to RGW. A SigV4 signing placeholder, not a cloud region: a single-zone
+# RGW (default zonegroup, no api_name) does not route or validate on it. Keep the default "us-east-1"
+# unless you have set a zonegroup api_name. us-east-1 is the one region for which boto3 omits
+# LocationConstraint from CreateBucket, so any other value makes CreateBucket fail with
+# InvalidLocationConstraint until the zonegroup api_name matches. Passed to the helpers as the AWS_REGION
+# environment var.
+rgw_tenants_s3_region: "us-east-1"
+
+# Fallback storage quota applied to any tenant that omits its own `quota`. Same shape as a tenant quota ({enabled,
+# max_size(bytes/-1), max_objects(count/-1)}). Default {} = no fallback (tenants without a quota stay at RGW's
+# unlimited default). Set a house default, e.g. {enabled: true, max_size: "{{ 1024 ** 4 }}", max_objects: -1} for 1
+# TiB, and any tenant can still override with its own quota.
+rgw_tenants_default_quota: {}
+
+# The tenants. Each item:
+#   name:        short tenant slug, alphanumeric.
+#                Used for the account-root uid (RGW forbids hyphens there) and as the default bucket-name prefix.
+#   account_id:  RGW account id, literally "RGW" + 17 digits (20 chars total),
+#                unique and stable per tenant so every role ARN is known from config.
+#   state:       optional "present" (default) or "absent".
+#                "absent" decommissions the tenant: buckets, OIDC provider, tier roles, account-root user,
+#                and the account are removed idempotently.
+#                Leave the entry in the list until it is torn down, then delete it and its vault keys.
+#                A non-empty bucket refuses to delete unless purge_objects: true.
+#   buckets:     optional list of bucket names to create as the account-root.
+#   quota:       optional per-account storage cap {enabled, max_size, max_objects}.
+#                max_size is in bytes (or -1 = unlimited), max_objects a count (or -1).
+#                Edit and re-run to raise or lower a tenant's ceiling.
+#                For readable sizes let kayobe do the math, e.g.
+#                max_size: "{{ 10 * 1024 ** 3 }}"  # 10 GiB
+#   limits:      optional per-account entity cap {max_users, max_buckets}, distinct from the storage quota above.
+#                -1 = unlimited. Omit to leave RGW defaults alone.
+#                It is all-or-nothing: an unspecified key defaults to -1 (unlimited), so set both if you mean to cap only one.
+#                Reconciled via `account modify`.
+#   root_user:   optional account-root uid (default "<name>root").
+#   rotate_keys: optional bool, per-tenant equivalent of rgw_tenants_rotate_keys (see the gates above).
+#                Rolls this tenant's account-root keys to the vaulted value.
+#   purge_objects: optional bool, only meaningful with state: absent.
+#                The destroy-data gate for teardown: allows deleting non-empty buckets (bucket rm --purge-objects)
+#                and cascades the account removal (account rm --purge-data) so tenant-created buckets/users/roles go too.
+#                Without it, a non-empty bucket or account fails the run rather than destroying data.
+#   bucket_prefix: optional S3 ARN prefix the tier policies scope to (default "<name>-", i.e. arn:aws:s3:::<name>-*).
+#                The account boundary already isolates tenants.
+#                This narrows a tier to a bucket-name convention.
+rgw_tenants_list: []
+
+# Where the Keycloak (or any OIDC) realm that mints web-identity tokens lives. One provider is registered per
+# tenant account (providers are account-scoped IAM resources).
+#   provider_url: the token issuer, incl. https:// (matches the JWT `iss`)
+#   client_ids:   accepted audiences (the RGW-facing OIDC client id(s))
+#   thumbprints:  SHA1 hex of the JWKS signing cert (use=sig x5c), not the TLS chain
+rgw_tenants_oidc:
+  provider_url: ""
+  client_ids: []
+  thumbprints: []
+
+# Standard access tiers -> permission-policy actions.
+# One <tenant>-<tier> role per tenant x tier, scoped to arn:aws:s3:::<prefix>* (+ /*). Override in the env to add or reshape
+# tiers.
+#   admin:  full control of the tenant's buckets/objects (incl. create/delete bucket)
+#   writer: list + read/write/delete objects (no bucket admin)
+#   reader: list + read objects only
+rgw_tenants_tiers:
+  - name: admin
+    actions: ["s3:*"]
+  - name: writer
+    actions: ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+  - name: reader
+    actions: ["s3:ListBucket", "s3:GetObject"]
